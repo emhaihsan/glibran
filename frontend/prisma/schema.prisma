@@ -78,7 +78,7 @@ model Job {
   type        JobType
   status      JobStatus @default(PENDING)
   inputUrl    String
-  outputData  Json?
+  resultUrl   String?
   cost        Int
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
