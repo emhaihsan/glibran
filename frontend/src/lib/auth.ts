@@ -15,16 +15,21 @@ export const authOptions: AuthOptions = {
     strategy: "jwt",
   },
   callbacks: {
+    async jwt({ token, user }) {
+      if (user) {
+        token.sub = user.id;
+      }
+      return token;
+    },
     async session({ session, token }) {
       if (session.user && token.sub) {
         session.user.id = token.sub;
-        
-        // Fetch credits from DB
+
         const dbUser = await prisma.user.findUnique({
           where: { id: token.sub },
-          select: { creditsAmount: true }
+          select: { creditsAmount: true },
         });
-        
+
         if (dbUser) {
           (session.user as any).creditsAmount = dbUser.creditsAmount;
         }

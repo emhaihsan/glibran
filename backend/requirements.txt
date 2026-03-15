@@ -1,4 +1,8 @@
-fastapi
-uvicorn
 modal
+fastapi[standard]
 pydantic
+boto3
+google-generativeai
+requests
+pysubs2
+numpy

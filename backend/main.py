@@ -1,260 +1,376 @@
 import modal
-from fastapi import FastAPI
-from pydantic import BaseModel
-import boto3
 import os
 import json
-import google.generativeai as genai
+import subprocess
+import pathlib
 
-# --- Configuration & App Setup ---
-app = FastAPI()
-stub = modal.App("glibran-backend")
-
-s3_client = boto3.client(
-    "s3",
-    aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-    region_name=os.environ.get("AWS_REGION", "us-east-1"),
+# ---------------------------------------------------------------------------
+# Modal App & Image
+# ---------------------------------------------------------------------------
+image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.12"
+    )
+    .apt_install(["ffmpeg", "libgl1-mesa-glx", "wget"])
+    .pip_install(
+        "boto3",
+        "fastapi[standard]",
+        "pydantic",
+        "google-generativeai",
+        "requests",
+        "pysubs2",
+        "numpy",
+    )
+    .pip_install(
+        "torch",
+        "torchaudio",
+        index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .run_commands(["pip install git+https://github.com/m-bain/whisperx.git"])
+    .run_commands(
+        [
+            "mkdir -p /usr/share/fonts/truetype/custom",
+            "wget -O /usr/share/fonts/truetype/custom/Anton-Regular.ttf "
+            "https://github.com/google/fonts/raw/main/ofl/anton/Anton-Regular.ttf",
+            "fc-cache -f -v",
+        ]
+    )
 )
-BUCKET_NAME = os.environ.get("AWS_S3_BUCKET_NAME", "glibran-storage-bucket")
 
-# --- Schemas ---
+app = modal.App("glibran-backend", image=image)
+
+volume = modal.Volume.from_name("glibran-model-cache", create_if_missing=True)
+
+
+# ---------------------------------------------------------------------------
+# Heavy GPU Worker – runs the full clipper pipeline in a single container
+# ---------------------------------------------------------------------------
+@app.cls(
+    gpu="A10G",
+    secrets=[modal.Secret.from_dotenv()],
+    timeout=3600,
+    volumes={"/root/.cache": volume},
+)
+class ClipperWorker:
+    """Loads AI models once via @modal.enter(), then processes videos."""
+
+    @modal.enter()
+    def load_models(self):
+        import whisperx
+        import torch
+        import google.generativeai as genai
+        import boto3
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
+
+        print("Loading WhisperX model…")
+        self.whisperx_model = whisperx.load_model(
+            "large-v2", device, compute_type="float16"
+        )
+        self.alignment_model, self.metadata = whisperx.load_align_model(
+            language_code="en", device=device
+        )
+        print("WhisperX loaded.")
+
+        print("Creating Gemini client…")
+        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+        self.gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+        print("Gemini client ready.")
+
+        self.s3 = boto3.client(
+            "s3",
+            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        )
+        self.bucket = os.environ.get(
+            "AWS_S3_BUCKET_NAME", "glibran-storage-bucket"
+        )
+
+    # -- internal helpers (not exposed as Modal methods) --------------------
+
+    def _transcribe(self, audio_path: str):
+        """Run WhisperX transcription + alignment, return word-level & segment-level results."""
+        import whisperx
+
+        audio = whisperx.load_audio(audio_path)
+        result = self.whisperx_model.transcribe(audio, batch_size=16)
+        result = whisperx.align(
+            result["segments"],
+            self.alignment_model,
+            self.metadata,
+            audio,
+            self.device,
+            return_char_alignments=False,
+        )
+        word_segments = []
+        for seg in result["segments"]:
+            for w in seg.get("words", []):
+                word_segments.append(w)
+        return word_segments, result["segments"]
+
+    def _identify_moments(self, segments: list) -> list:
+        """Ask Gemini 2.5 Flash to pick the most viral moments."""
+        full_text = ""
+        for seg in segments:
+            s = seg.get("start", 0)
+            e = seg.get("end", 0)
+            t = seg.get("text", "").strip()
+            full_text += f"[{s:.2f} - {e:.2f}] {t}\n"
+
+        prompt = (
+            "You are an expert short-form video editor for TikTok/YouTube Shorts.\n"
+            "Analyze this transcript and find the 1-3 most engaging viral moments "
+            "suitable for short clips (15-60 seconds each).\n"
+            "Look for: compelling stories, surprising facts, funny moments, "
+            "controversial opinions, or emotional peaks.\n"
+            "Return ONLY a valid JSON array. No markdown code blocks.\n"
+            'Format: [{"start_time": 10.5, "end_time": 45.2, '
+            '"title": "Clip title", "viral_score": 85}]\n\n'
+            f"Transcript:\n{full_text}"
+        )
+
+        response = self.gemini_model.generate_content(prompt)
+        cleaned = response.text.strip()
+        # Strip markdown fences if present
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:].strip()
+
+        return json.loads(cleaned)
+
+    def _create_subtitles(
+        self,
+        word_segments: list,
+        clip_start: float,
+        clip_end: float,
+        output_path: str,
+        max_words: int = 5,
+    ):
+        """Build an ASS subtitle file from word-level timestamps."""
+        import pysubs2
+
+        clip_words = [
+            w
+            for w in word_segments
+            if w.get("start") is not None
+            and w.get("end") is not None
+            and w["end"] > clip_start
+            and w["start"] < clip_end
+        ]
+
+        groups: list[tuple[float, float, str]] = []
+        buf: list[str] = []
+        buf_s = buf_e = 0.0
+
+        for w in clip_words:
+            txt = w.get("word", "").strip()
+            if not txt:
+                continue
+            s_rel = max(0.0, w["start"] - clip_start)
+            e_rel = max(0.0, w["end"] - clip_start)
+            if not buf:
+                buf_s, buf_e, buf = s_rel, e_rel, [txt]
+            elif len(buf) >= max_words:
+                groups.append((buf_s, buf_e, " ".join(buf)))
+                buf_s, buf_e, buf = s_rel, e_rel, [txt]
+            else:
+                buf.append(txt)
+                buf_e = e_rel
+        if buf:
+            groups.append((buf_s, buf_e, " ".join(buf)))
+
+        subs = pysubs2.SSAFile()
+        subs.info["PlayResX"] = 1080
+        subs.info["PlayResY"] = 1920
+        subs.info["ScaledBorderAndShadow"] = "yes"
+        subs.info["ScriptType"] = "v4.00+"
+
+        style = pysubs2.SSAStyle()
+        style.fontname = "Anton"
+        style.fontsize = 80
+        style.primarycolor = pysubs2.Color(255, 255, 255)
+        style.outlinecolor = pysubs2.Color(0, 0, 0)
+        style.outline = 3.0
+        style.shadow = 2.0
+        style.alignment = 2
+        style.marginv = 150
+        style.marginl = 50
+        style.marginr = 50
+        style.bold = True
+        subs.styles["Default"] = style
+
+        for s, e, txt in groups:
+            subs.events.append(
+                pysubs2.SSAEvent(
+                    start=pysubs2.make_time(s=s),
+                    end=pysubs2.make_time(s=e),
+                    text=txt.upper(),
+                    style="Default",
+                )
+            )
+        subs.save(output_path)
+
+    def _notify_frontend(self, job_id: str, status: str, clips: list, error: str | None = None):
+        """POST the result back to the Next.js webhook endpoint."""
+        import requests
+
+        base = os.environ.get("NEXT_PUBLIC_APP_URL", "http://localhost:3000")
+        payload: dict = {"job_id": job_id, "status": status, "clips": clips}
+        if error:
+            payload["error"] = error
+        try:
+            requests.post(f"{base}/api/webhooks/modal", json=payload, timeout=15)
+            print(f"[{job_id}] Webhook sent ({status})")
+        except Exception as e:
+            print(f"[{job_id}] Webhook failed: {e}")
+
+    # -- main pipeline (exposed as a Modal method) --------------------------
+
+    @modal.method()
+    def process_video(self, job_id: str, video_s3_key: str):
+        base = pathlib.Path(f"/tmp/{job_id}")
+        base.mkdir(parents=True, exist_ok=True)
+        video_path = str(base / "raw.mp4")
+        audio_path = str(base / "audio.wav")
+
+        print(f"[{job_id}] Pipeline starting")
+
+        try:
+            # 1. Download from S3
+            print(f"[{job_id}] Downloading video…")
+            self.s3.download_file(self.bucket, video_s3_key, video_path)
+
+            # 2. Extract audio (WAV 16 kHz mono for WhisperX)
+            print(f"[{job_id}] Extracting audio…")
+            subprocess.run(
+                f"ffmpeg -y -i {video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}",
+                shell=True,
+                check=True,
+                capture_output=True,
+            )
+
+            # 3. Transcribe with WhisperX
+            print(f"[{job_id}] Transcribing…")
+            word_segs, full_segs = self._transcribe(audio_path)
+            print(f"[{job_id}] Got {len(word_segs)} words")
+
+            # 4. Find viral moments via Gemini
+            print(f"[{job_id}] Analysing with Gemini…")
+            moments = self._identify_moments(full_segs)
+            print(f"[{job_id}] Found {len(moments)} moments")
+
+            # 5. Process each clip
+            clips_out: list[dict] = []
+            for i, m in enumerate(moments):
+                st = m.get("start_time")
+                et = m.get("end_time")
+                if st is None or et is None:
+                    continue
+
+                cdir = base / f"clip_{i}"
+                cdir.mkdir(exist_ok=True)
+                seg_path = str(cdir / "seg.mp4")
+                vert_path = str(cdir / "vert.mp4")
+                sub_path = str(cdir / "subs.ass")
+                final_path = str(cdir / "final.mp4")
+
+                dur = et - st
+
+                # 5a. Cut segment
+                subprocess.run(
+                    f"ffmpeg -y -ss {st} -t {dur} -i {video_path} -c copy {seg_path}",
+                    shell=True,
+                    check=True,
+                    capture_output=True,
+                )
+
+                # 5b. Vertical crop (9:16) with blurred background fill
+                vf = (
+                    "split[original][blur];"
+                    "[blur]scale=1080:1920:force_original_aspect_ratio=increase,"
+                    "crop=1080:1920,boxblur=20:5[bg];"
+                    "[original]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+                    "[bg][fg]overlay=(W-w)/2:(H-h)/2"
+                )
+                subprocess.run(
+                    f'ffmpeg -y -i {seg_path} -filter_complex "{vf}" '
+                    f"-c:v h264 -preset fast -crf 23 -c:a aac -b:a 128k {vert_path}",
+                    shell=True,
+                    check=True,
+                    capture_output=True,
+                )
+
+                # 5c. Burn subtitles
+                self._create_subtitles(word_segs, st, et, sub_path)
+                subprocess.run(
+                    f'ffmpeg -y -i {vert_path} -vf "ass={sub_path}" '
+                    f"-c:v h264 -preset fast -crf 23 -c:a copy {final_path}",
+                    shell=True,
+                    check=True,
+                    capture_output=True,
+                )
+
+                # 5d. Upload to S3
+                clip_s3_key = f"processed/{job_id}/clip_{i}.mp4"
+                self.s3.upload_file(
+                    final_path,
+                    self.bucket,
+                    clip_s3_key,
+                    ExtraArgs={"ContentType": "video/mp4"},
+                )
+                clip_url = f"https://{self.bucket}.s3.amazonaws.com/{clip_s3_key}"
+                clips_out.append(
+                    {
+                        "clip_url": clip_url,
+                        "s3_key": clip_s3_key,
+                        "title": m.get("title", f"Clip {i}"),
+                        "viral_score": m.get("viral_score", 0),
+                    }
+                )
+                print(f"[{job_id}] Clip {i} done")
+
+            # 6. Notify frontend
+            self._notify_frontend(job_id, "COMPLETED", clips_out)
+            print(f"[{job_id}] Pipeline complete!")
+            return clips_out
+
+        except Exception as e:
+            print(f"[{job_id}] FAILED: {e}")
+            self._notify_frontend(job_id, "FAILED", [], str(e))
+            raise
+
+
+# ---------------------------------------------------------------------------
+# FastAPI entrypoint – lightweight, no GPU
+# ---------------------------------------------------------------------------
+from pydantic import BaseModel
+
+
 class ProcessVideoRequest(BaseModel):
     job_id: str
     video_s3_key: str
 
-# --- Modal Image Definition ---
-# This defines the environment our Serverless GPU function runs in
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg")
-    .pip_install("boto3", "fastapi", "pydantic", "google-generativeai", "requests")
-    .env({
-        "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
-        "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
-        "AWS_REGION": os.environ.get("AWS_REGION", "ap-southeast-1")
-    })
-)
 
-# WhisperX requires a specific PyTorch/CUDA environment
-whisper_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg", "git")
-    .pip_install(
-        "torch", 
-        "torchaudio", 
-        index_url="https://download.pytorch.org/whl/cu121"
-    )
-    .pip_install("git+https://github.com/m-bain/whisperx.git")
-    .env({
-        "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
-        "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
-        "AWS_REGION": os.environ.get("AWS_REGION", "ap-southeast-1")
-    })
-)
-
-# --- Core Serverless Functions ---
-@stub.function(image=image, secrets=[modal.Secret.from_dotenv()])
-def download_from_s3(s3_key: str, local_path: str):
-    """Downloads a file from S3 to the Modal container's ephemeral storage."""
-    print(f"Downloading {s3_key} to {local_path} from S3...")
-    s3_client.download_file(BUCKET_NAME, s3_key, local_path)
-    print("Download complete.")
-    return True
-
-@stub.function(image=image, secrets=[modal.Secret.from_dotenv()])
-def extract_audio(video_path: str, audio_path: str):
-    """Extracts audio from downloaded video using FFmpeg."""
-    print(f"Extracting audio from {video_path}...")
-    import subprocess
-    cmd = [
-        "ffmpeg", "-i", video_path, 
-        "-vn", "-acodec", "libmp3lame", 
-        "-ar", "16000", "-ac", "1", 
-        "-y", audio_path
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
-    print(f"Audio extracted to {audio_path}")
-    return True
-
-@stub.function(image=image, secrets=[modal.Secret.from_dotenv()])
-def upload_to_s3(local_path: str, s3_key: str):
-    """Uploads a generated clip back to S3."""
-    print(f"Uploading {local_path} to {s3_key}...")
-    s3_client.upload_file(local_path, BUCKET_NAME, s3_key, ExtraArgs={'ContentType': 'video/mp4'})
-    print("Upload complete.")
-    return f"https://{BUCKET_NAME}.s3.amazonaws.com/{s3_key}"
-
-@stub.function(image=image, secrets=[modal.Secret.from_dotenv()])
-def crop_and_subtitle(video_path: str, audio_path: str, start_time: float, end_time: float, output_path: str):
-    """
-    Crops video to 9:16 aspect ratio (center crop for MVP), 
-    trims it to the specified start/end times, and burns basic subtitles.
-    """
-    import subprocess
-    print(f"Cropping from {start_time} to {end_time}...")
-    
-    # 1. Generate local ASS subtitles file from whisper (for MVP we just do a fast trim/crop)
-    # 2. Trim and Crop (9:16 vertical center)
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(start_time),
-        "-to", str(end_time),
-        "-i", video_path,
-        "-vf", "crop=ih*9/16:ih", # Fast center crop 9:16
-        "-c:a", "aac",
-        output_path
-    ]
-    
-    subprocess.run(cmd, check=True, capture_output=True)
-    print(f"Clip saved to {output_path}")
-    return True
-
-@stub.function(image=whisper_image, gpu="A10G", timeout=1200)
-def run_whisperx(audio_path: str):
-    """Transcribes audio using WhisperX with word-level timestamps."""
-    print(f"Starting WhisperX transcription for {audio_path}...")
-    import whisperx
-    import torch
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size = 16 
-    
-    # Load model
-    model = whisperx.load_model("large-v2", device, compute_type="float16")
-    
-    # Transcribe
-    audio = whisperx.load_audio(audio_path)
-    result = model.transcribe(audio, batch_size=batch_size)
-    
-    # Align timestamps
-    model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
-    result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
-    
-    print("Transcription complete.")
-    return result["segments"]
-
-@stub.function(image=image, secrets=[modal.Secret.from_dotenv()])
-def analyze_viral_moments(transcript_segments: list):
-    """Uses Gemini 2.5 Flash to find the most viral moments in the transcript."""
-    print("Analyzing transcript with Gemini 2.5 Flash...")
-    
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    
-    # Prepare text for LLM
-    full_text = ""
-    for seg in transcript_segments:
-        start = seg.get('start', 0)
-        end = seg.get('end', 0)
-        text = seg.get('text', '').strip()
-        full_text += f"[{start:.2f} - {end:.2f}] {text}\n"
-
-    prompt = f"""
-    You are an expert short-form video editor (TikTok/Reels). 
-    Analyze the following video transcript using the provided timestamps.
-    Identify the 1 to 3 most engaging, "viral" moments suitable for short-form clips (between 15 to 60 seconds each).
-    Return ONLY a valid JSON array of objects with 'start_time', 'end_time', 'title', and 'viral_score' (1-100). Do not use markdown blocks.
-    
-    Transcript:
-    {full_text}
-    """
-    
-    model = genai.GenerativeModel("gemini-2.5-flash")
-    response = model.generate_content(prompt)
-    
-    try:
-        # Strip potential markdown formatting from Gemini response
-        cleaned_response = response.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        clips = json.loads(cleaned_response)
-        print(f"Found {len(clips)} viral clips.")
-        return clips
-    except Exception as e:
-        print(f"Failed to parse Gemini response: {e}")
-        return []
-
-@app.post("/process-video")
-async def trigger_video_processing(request: ProcessVideoRequest):
-    """
-    Entrypoint API called by Next.js Inngest.
-    This routes the request to our heavy GPU instance on Modal.
-    """
-    print(f"Received request to process job: {request.job_id}")
-    
-    # We trigger the intensive logic asynchronously (fire and forget)
-    run_clipper_pipeline.spawn(request.job_id, request.video_s3_key)
-    
-    return {"status": "success", "job_id": request.job_id, "message": "Processing started on Modal"}
-
-
-@stub.function(image=image, secrets=[modal.Secret.from_dotenv()], timeout=3600)
-def run_clipper_pipeline(job_id: str, video_s3_key: str):
-    """The main orchestration pipeline that runs on Modal Serverless GPUs."""
-    import os
-    
-    os.makedirs("/tmp/clips", exist_ok=True)
-    local_video_path = f"/tmp/{job_id}_raw.mp4"
-    local_audio_path = f"/tmp/{job_id}_audio.mp3"
-    
-    print(f"[JOB {job_id}] Starting Clipper Pipeline")
-
-    try:
-        # Step 1: Download from S3 (Task 2.2)
-        download_from_s3.remote(video_s3_key, local_video_path)
-        
-        # Step 2: Extract Audio
-        extract_audio.remote(local_video_path, local_audio_path)
-        
-        # Step 3: Transcribe with WhisperX (Task 2.3)
-        print(f"[JOB {job_id}] Starting Transcription...")
-        transcript = run_whisperx.remote(local_audio_path)
-        
-        # Step 4: Analyze with Gemini 2.5 Flash (Task 2.3)
-        print(f"[JOB {job_id}] Analyzing moments with LLM...")
-        viral_clips = analyze_viral_moments.remote(transcript)
-        
-        print(f"[JOB {job_id}] Viral Clips Detected: {viral_clips}")
-        
-        # Step 5: Crop and Upload (Task 2.4)
-        output_urls = []
-        for i, clip in enumerate(viral_clips):
-            start_t = clip.get('start_time')
-            end_t = clip.get('end_time')
-            if start_t is None or end_t is None: continue
-            
-            clip_local_path = f"/tmp/clips/{job_id}_clip_{i}.mp4"
-            clip_s3_key = f"processed/{job_id}/clip_{i}.mp4"
-            
-            # Run FFMPEG cropping
-            crop_and_subtitle.remote(local_video_path, local_audio_path, start_t, end_t, clip_local_path)
-            
-            # Upload back to S3
-            s3_url = upload_to_s3.remote(clip_local_path, clip_s3_key)
-            output_urls.append({"clip_url": s3_url, "title": clip.get("title", f"Clip {i}")})
-            
-        print(f"[JOB {job_id}] Full Pipeline Finished. outputs: {output_urls}")
-        
-        # Step 6: Notify Frontend Webhook (Task 2.5)
-        import requests
-        frontend_url = os.environ.get("NEXT_PUBLIC_APP_URL", "http://localhost:3000")
-        webhook_url = f"{frontend_url}/api/webhooks/modal"
-        
-        payload = {
-            "job_id": job_id,
-            "status": "COMPLETED",
-            "clips": output_urls
-        }
-        
-        try:
-            requests.post(webhook_url, json=payload, timeout=10)
-            print(f"[JOB {job_id}] Webhook sent successfully.")
-        except Exception as webhook_err:
-            print(f"[JOB {job_id}] Warning: Failed to send webhook: {webhook_err}")
-            
-    except Exception as e:
-        print(f"[JOB {job_id}] FAILED: {str(e)}")
-        # In actual production, we'd send a webhook back to Next.js stating it failed.
-
-@stub.function(image=image)
+@app.function(secrets=[modal.Secret.from_dotenv()])
 @modal.asgi_app()
 def fastapi_app():
-    return app
+    from fastapi import FastAPI
+
+    api = FastAPI(title="Glibran Backend")
+
+    @api.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @api.post("/process-video")
+    async def process_video(req: ProcessVideoRequest):
+        ClipperWorker().process_video.spawn(req.job_id, req.video_s3_key)
+        return {"status": "processing", "job_id": req.job_id}
+
+    return api
