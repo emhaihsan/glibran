@@ -1,36 +1,42 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Glibran API Mesh & Frontend Client 🖥️
 
-## Getting Started
+This directory hosts the complete Frontend client that orchestrates background workflows, presents user actions displays, captures directly signed file responses uploading to secure triggers handling monetization payouts routing safely.
 
-First, run the development server:
+---
+
+## ⚡ Tech Stack Details
+
+*   **Next.js 16** (App Directory + React Server Components)
+*   **Tailwind CSS v4** + **Shadcn UI** components setups inside `/src`.
+*   **NextAuth Hooks**: Setup endpoints using Auth configurations mapped cleanly.
+*   **Prisma v7**: Structured relational pools targeting lightweight triggers fast responses safely.
+
+## 🛠️ Environment Variables Configuration (`/.env`)
+
+Make sure you copy setting configurations properly set endpoints locally:
+*   `DATABASE_URL` 
+*   `NEXTAUTH_SECRET` / `NEXTAUTH_URL`
+*   `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`
+*   `MAYAR_WEBHOOK_SECRET` / `MAYAR_API_KEY`
+*   `AWS_REGION` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+
+---
+
+## 🏃 Getting Started
+
+First, install dependencies and run the development server:
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the live view render.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## 📁 Key Routes Layout Index
+-   📂 `src/app/` - Base App Router entry interfaces.
+-   📂 `src/lib/` - Shared core singletons setup handlers (**Prisma, next-auth, AWS S3 buckets mappings**).
+-   📂 `src/components/` - Common UI widgets helpers triggers layouts.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+---
+*Back to dashboard root index file [../README.md](../README.md).*
