@@ -7,7 +7,7 @@ import { generatePresignedUrl } from "./s3";
 import { inngest } from "@/inngest/client";
 import { revalidatePath } from "next/cache";
 
-import { CLIP_COST, CREDIT_PACKS } from "./constants";
+import { CLIP_COST, THUMBNAIL_COST, AVATAR_COST } from "./constants";
 
 export async function getPresignedUploadUrl(fileName: string) {
   const session = await getServerSession(authOptions);
@@ -73,54 +73,88 @@ export async function refreshDashboard() {
 }
 
 // ---------------------------------------------------------------------------
-// Mayar Top-Up – creates a ReqPayment link and returns the checkout URL
+// Thumbnail Generation
 // ---------------------------------------------------------------------------
-
-
-export async function createTopUpLink(packIndex: number) {
-  const { createPaymentRequest } = await import("./mayar");
+export async function createThumbnailJob(s3Key: string, headline: string) {
   const session = await getServerSession(authOptions);
-  if (!session?.user?.id || !session.user.email) {
-    return { error: "Not authenticated" };
-  }
-
-  const pack = CREDIT_PACKS[packIndex];
-  if (!pack) {
-    return { error: "Invalid credit pack" };
-  }
+  if (!session?.user?.id) return { error: "Not authenticated" };
 
   const user = await prisma.user.findUnique({
     where: { id: session.user.id },
-    select: { name: true, email: true },
+    select: { creditsAmount: true },
+  });
+  if (!user || user.creditsAmount < THUMBNAIL_COST) {
+    return { error: "Insufficient credits." };
+  }
+
+  await prisma.user.update({
+    where: { id: session.user.id },
+    data: { creditsAmount: { decrement: THUMBNAIL_COST } },
   });
 
-  if (!user || !user.email) {
-    return { error: "User not found" };
+  const job = await prisma.job.create({
+    data: {
+      userId: session.user.id,
+      type: "THUMBNAIL_GENERATION",
+      status: "PENDING",
+      inputUrl: s3Key,
+      cost: THUMBNAIL_COST,
+    },
+  });
+
+  await inngest.send({
+    name: "thumbnail.requested",
+    data: { jobId: job.id, imageS3Key: s3Key, headline, userId: session.user.id },
+  });
+
+  revalidatePath("/dashboard");
+  return { success: true, jobId: job.id };
+}
+
+// ---------------------------------------------------------------------------
+// Avatar Generation
+// ---------------------------------------------------------------------------
+export async function createAvatarJob(s3Key: string, scriptText: string) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.id) return { error: "Not authenticated" };
+
+  const user = await prisma.user.findUnique({
+    where: { id: session.user.id },
+    select: { creditsAmount: true },
+  });
+  if (!user || user.creditsAmount < AVATAR_COST) {
+    return { error: "Insufficient credits." };
   }
 
-  const appUrl = process.env.NEXTAUTH_URL || "http://localhost:3000";
-  const expiry = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  await prisma.user.update({
+    where: { id: session.user.id },
+    data: { creditsAmount: { decrement: AVATAR_COST } },
+  });
 
-  try {
-    const result = await createPaymentRequest({
-      name: user.name || "Glibran User",
-      email: user.email,
-      mobile: "08000000000",
-      amount: pack.priceIDR,
-      description: `Glibran Top-Up: ${pack.label}`,
-      redirectUrl: `${appUrl}/dashboard?topup=success`,
-      expiredAt: expiry,
-    });
+  const job = await prisma.job.create({
+    data: {
+      userId: session.user.id,
+      type: "AVATAR_GENERATION",
+      status: "PENDING",
+      inputUrl: s3Key,
+      cost: AVATAR_COST,
+    },
+  });
 
-    // result.link is the Mayar checkout URL path
-    // Full URL depends on merchant subdomain. The API returns a full link.
-    const checkoutUrl = result.link.startsWith("http")
-      ? result.link
-      : `https://mayar.id/${result.link}`;
+  await inngest.send({
+    name: "avatar.requested",
+    data: { jobId: job.id, photoS3Key: s3Key, scriptText, userId: session.user.id },
+  });
 
-    return { success: true, checkoutUrl };
-  } catch (err: any) {
-    console.error("[TopUp] Mayar API error:", err);
-    return { error: err.message || "Failed to create payment link" };
-  }
+  revalidatePath("/dashboard");
+  return { success: true, jobId: job.id };
+}
+
+export async function getPresignedImageUploadUrl(fileName: string) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.id) return { error: "Not authenticated" };
+
+  const s3Key = `raw/${session.user.id}/${Date.now()}_${fileName}`;
+  const url = await generatePresignedUrl(s3Key, "image/png");
+  return { url, s3Key };
 }
