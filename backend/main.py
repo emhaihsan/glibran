@@ -3,7 +3,7 @@ import modal
 
 app = FastAPI()
 
-stub = modal.Stub("glibran-backend")
+stub = modal.App("glibran-backend")
 
 @app.get("/")
 def read_root():
